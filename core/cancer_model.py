@@ -113,54 +113,56 @@ class CancerService:
         ]
 
     def _forward(
-        self,
-        rgb_small: np.ndarray
-    ) -> tuple[float, np.ndarray]:
+    self,
+    rgb_small: np.ndarray
+) -> tuple[float, np.ndarray]:
 
-        tf = self.tf
+    tf = self.tf
 
-        batch = tf.convert_to_tensor(
-            rgb_small[None].astype("float32")
+    batch = tf.convert_to_tensor(
+        rgb_small[None].astype("float32")
+    )
+
+    with tf.GradientTape() as tape:
+        conv_out, feats = self.conv_model(
+            batch,
+            training=False
         )
 
-        with tf.GradientTape() as tape:
-            conv_out, feats = self.conv_model(
-                batch,
+        x = feats
+
+        for layer in self.head_layers:
+            x = layer(
+                x,
                 training=False
             )
 
-            x = feats
+        score = tf.reshape(x, [-1])
 
-            for layer in self.head_layers:
-                x = layer(
-                    x,
-                    training=False
-                )
+    grads = tape.gradient(
+        score,
+        conv_out
+    )
 
-            score = x[:, 0]
+    pooled = tf.reduce_mean(
+        grads,
+        axis=(0, 1, 2)
+    )
 
-        grads = tape.gradient(
-            score,
-            conv_out
-        )
+    cam = tf.squeeze(
+        conv_out[0] @ pooled[..., tf.newaxis]
+    )
 
-        pooled = tf.reduce_mean(
-            grads,
-            axis=(0, 1, 2)
-        )
+    cam = tf.maximum(cam, 0) / (
+        tf.math.reduce_max(cam) + 1e-9
+    )
 
-        cam = tf.squeeze(
-            conv_out[0] @ pooled[..., tf.newaxis]
-        )
+    return (
+        float(score[0]),
+        cam.numpy()
+    )
 
-        cam = tf.maximum(cam, 0) / (
-            tf.math.reduce_max(cam) + 1e-9
-        )
-
-        return (
-    float(tf.reshape(score, [-1])[0].numpy()),
-    cam.numpy()
-)
+    
 
     def analyze(
         self,
