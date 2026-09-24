@@ -18,572 +18,589 @@ from PIL import Image
 from .config import CANCER_CONFIG_PATH, CANCER_MODEL_PATH, MAX_IMAGE_PIXELS
 from .vitals_model import ModelUnavailable
 
+
 DISPLAY_MAX_SIDE = 1000
 POI_RELATIVE_THRESHOLD = 0.60
 POI_MIN_AREA_FRACTION = 0.002
 POI_RED = (255, 45, 85)
 
+
 @dataclass
 class CancerResult:
-probability: float
-threshold: float
-is_cancer: bool
-confidence: float
-bbox: tuple[int, int, int, int] | None
-original: np.ndarray
-annotated: np.ndarray
-heatmap_overlay: np.ndarray
-class_name: str
+    probability: float
+    threshold: float
+    is_cancer: bool
+    confidence: float
+    bbox: tuple[int, int, int, int] | None
+    original: np.ndarray
+    annotated: np.ndarray
+    heatmap_overlay: np.ndarray
+    class_name: str
+
 
 def adjusted_confidence(p: float, threshold: float) -> float:
-t = min(max(threshold, 1e-6), 1 - 1e-6)
+    t = min(max(threshold, 1e-6), 1 - 1e-6)
 
-```
-if p >= t:
-    return 0.5 + 0.5 * (p - t) / (1 - t)
+    if p >= t:
+        return 0.5 + 0.5 * (p - t) / (1 - t)
 
-return 0.5 + 0.5 * (t - p) / t
-```
+    return 0.5 + 0.5 * (t - p) / t
+
 
 class CancerService:
-def **init**(self, model, config: dict):
-import tensorflow as tf
 
-```
-    self.tf = tf
-    self.model = model
+    def __init__(self, model, config: dict):
+        import tensorflow as tf
 
-    self.img_size = tuple(
-        int(x) for x in config["img_size"]
-    )
+        self.tf = tf
+        self.model = model
 
-    self.threshold = float(
-        config["decision_threshold"]
-    )
-
-    self.class_names = list(
-        config.get(
-            "class_names",
-            ["No Cancer", "Cancer"]
+        self.img_size = tuple(
+            int(x) for x in config["img_size"]
         )
-    )
 
-    self.last_conv = config[
-        "last_conv_layer_name"
-    ]
+        self.threshold = float(
+            config["decision_threshold"]
+        )
 
-    backbone = next(
-        (
-            layer
-            for layer in model.layers
-            if isinstance(layer, tf.keras.Model)
-        ),
-        None,
-    )
+        self.class_names = list(
+            config.get(
+                "class_names",
+                ["No Cancer", "Cancer"],
+            )
+        )
 
-    if backbone is None:
+        self.last_conv = config[
+            "last_conv_layer_name"
+        ]
+
+        # Find the EfficientNet backbone.
         backbone = next(
             (
                 layer
                 for layer in model.layers
-                if "efficientnet" in layer.name.lower()
+                if isinstance(layer, tf.keras.Model)
             ),
             None,
         )
 
-    if backbone is None:
-        raise ModelUnavailable(
-            "Could not find the EfficientNet backbone "
-            "inside the saved model."
-        )
-
-    self.conv_model = tf.keras.Model(
-        backbone.input,
-        [
-            backbone.get_layer(
-                self.last_conv
-            ).output,
-            backbone.output,
-        ],
-    )
-
-    self.head_layers = model.layers[
-        model.layers.index(backbone) + 1:
-    ]
-
-def _forward(
-    self,
-    rgb_small: np.ndarray
-) -> tuple[float, np.ndarray]:
-
-    tf = self.tf
-
-    batch = tf.convert_to_tensor(
-        rgb_small[None].astype("float32")
-    )
-
-    with tf.GradientTape() as tape:
-        conv_out, feats = self.conv_model(
-            batch,
-            training=False
-        )
-
-        x = feats
-
-        for layer in self.head_layers:
-            x = layer(
-                x,
-                training=False
+        if backbone is None:
+            backbone = next(
+                (
+                    layer
+                    for layer in model.layers
+                    if "efficientnet" in layer.name.lower()
+                ),
+                None,
             )
 
-        # The classifier should produce one score
-        # for the single input image.
-        #
-        # tf.reshape(x, ()) forces the result to be
-        # a 0-dimensional Tensor, which can safely be
-        # converted to a Python float.
-        score = tf.reshape(x, ())
+        if backbone is None:
+            raise ModelUnavailable(
+                "Could not find the EfficientNet backbone "
+                "inside the saved model."
+            )
 
-    grads = tape.gradient(
-        score,
-        conv_out
-    )
+        try:
+            last_conv_layer = backbone.get_layer(
+                self.last_conv
+            )
+        except Exception as exc:
+            raise ModelUnavailable(
+                f"Could not find Grad-CAM layer "
+                f"'{self.last_conv}' inside the backbone."
+            ) from exc
 
-    if grads is None:
-        raise ModelUnavailable(
-            "Could not calculate Grad-CAM gradients "
-            "for the breast-cancer model."
+        self.conv_model = tf.keras.Model(
+            backbone.input,
+            [
+                last_conv_layer.output,
+                backbone.output,
+            ],
         )
 
-    pooled = tf.reduce_mean(
-        grads,
-        axis=(0, 1, 2)
-    )
+        self.head_layers = model.layers[
+            model.layers.index(backbone) + 1:
+        ]
 
-    cam = tf.squeeze(
-        conv_out[0] @ pooled[..., tf.newaxis]
-    )
+    def _forward(
+        self,
+        rgb_small: np.ndarray,
+    ) -> tuple[float, np.ndarray]:
 
-    cam = tf.maximum(cam, 0)
+        tf = self.tf
 
-    cam = cam / (
-        tf.math.reduce_max(cam) + 1e-9
-    )
-
-    # score is now a 0-dimensional Tensor.
-    probability = float(
-        score.numpy()
-    )
-
-    return (
-        probability,
-        cam.numpy()
-    )
-
-def analyze(
-    self,
-    image: Image.Image
-) -> CancerResult:
-
-    rgb = image.convert("RGB")
-
-    small = rgb.resize(
-        self.img_size,
-        Image.NEAREST
-    )
-
-    prob, cam = self._forward(
-        np.asarray(small)
-    )
-
-    display = fit_display(rgb)
-
-    h, w = display.shape[:2]
-
-    cam_big = cv2.resize(
-        cam,
-        (w, h),
-        interpolation=cv2.INTER_CUBIC
-    )
-
-    cam_big = np.clip(
-        cam_big,
-        0,
-        1
-    )
-
-    is_cancer = (
-        prob >= self.threshold
-    )
-
-    bbox = (
-        _largest_region(cam_big)
-        if is_cancer
-        else None
-    )
-
-    annotated = display.copy()
-
-    if bbox is not None:
-        _draw_poi(
-            annotated,
-            bbox
+        batch = tf.convert_to_tensor(
+            rgb_small[None].astype("float32")
         )
 
-    return CancerResult(
-        probability=prob,
-        threshold=self.threshold,
-        is_cancer=is_cancer,
-        confidence=adjusted_confidence(
-            prob,
-            self.threshold
-        ),
-        bbox=bbox,
-        original=display,
-        annotated=annotated,
-        heatmap_overlay=_overlay(
-            display,
-            cam_big
-        ),
-        class_name=(
-            self.class_names[1]
+        with tf.GradientTape() as tape:
+
+            conv_out, feats = self.conv_model(
+                batch,
+                training=False,
+            )
+
+            x = feats
+
+            for layer in self.head_layers:
+                x = layer(
+                    x,
+                    training=False,
+                )
+
+            # Convert the classifier output into a flat tensor.
+            score_values = tf.reshape(
+                x,
+                [-1],
+            )
+
+            # We expect exactly one classifier value
+            # for one input image.
+            if int(tf.size(score_values).numpy()) != 1:
+                raise ModelUnavailable(
+                    "Unexpected classifier output shape: "
+                    f"{x.shape}. Expected exactly one "
+                    "output value for a single image."
+                )
+
+            score = score_values[0]
+
+        grads = tape.gradient(
+            score,
+            conv_out,
+        )
+
+        if grads is None:
+            raise ModelUnavailable(
+                "Could not calculate Grad-CAM gradients "
+                "for the breast-cancer model."
+            )
+
+        pooled = tf.reduce_mean(
+            grads,
+            axis=(0, 1, 2),
+        )
+
+        cam = tf.squeeze(
+            conv_out[0] @ pooled[..., tf.newaxis]
+        )
+
+        cam = tf.maximum(
+            cam,
+            0,
+        )
+
+        cam = cam / (
+            tf.math.reduce_max(cam) + 1e-9
+        )
+
+        # score is now a scalar Tensor.
+        probability = float(
+            score.numpy()
+        )
+
+        return (
+            probability,
+            cam.numpy(),
+        )
+
+    def analyze(
+        self,
+        image: Image.Image,
+    ) -> CancerResult:
+
+        rgb = image.convert("RGB")
+
+        small = rgb.resize(
+            self.img_size,
+            Image.NEAREST,
+        )
+
+        prob, cam = self._forward(
+            np.asarray(small)
+        )
+
+        display = fit_display(rgb)
+
+        h, w = display.shape[:2]
+
+        cam_big = cv2.resize(
+            cam,
+            (w, h),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        cam_big = np.clip(
+            cam_big,
+            0,
+            1,
+        )
+
+        is_cancer = (
+            prob >= self.threshold
+        )
+
+        bbox = (
+            _largest_region(cam_big)
             if is_cancer
-            else self.class_names[0]
-        ),
-    )
-```
+            else None
+        )
+
+        annotated = display.copy()
+
+        if bbox is not None:
+            _draw_poi(
+                annotated,
+                bbox,
+            )
+
+        return CancerResult(
+            probability=prob,
+            threshold=self.threshold,
+            is_cancer=is_cancer,
+            confidence=adjusted_confidence(
+                prob,
+                self.threshold,
+            ),
+            bbox=bbox,
+            original=display,
+            annotated=annotated,
+            heatmap_overlay=_overlay(
+                display,
+                cam_big,
+            ),
+            class_name=(
+                self.class_names[1]
+                if is_cancer
+                else self.class_names[0]
+            ),
+        )
+
 
 def fit_display(
-rgb: Image.Image
+    rgb: Image.Image,
 ) -> np.ndarray:
 
-```
-w, h = rgb.size
+    w, h = rgb.size
 
-scale = min(
-    1.0,
-    DISPLAY_MAX_SIDE / max(w, h)
-)
-
-if scale < 1.0:
-    rgb = rgb.resize(
-        (
-            max(1, int(w * scale)),
-            max(1, int(h * scale)),
-        ),
-        Image.LANCZOS
+    scale = min(
+        1.0,
+        DISPLAY_MAX_SIDE / max(w, h),
     )
 
-return np.asarray(
-    rgb,
-    dtype=np.uint8
-).copy()
-```
+    if scale < 1.0:
+        rgb = rgb.resize(
+            (
+                max(1, int(w * scale)),
+                max(1, int(h * scale)),
+            ),
+            Image.LANCZOS,
+        )
+
+    return np.asarray(
+        rgb,
+        dtype=np.uint8,
+    ).copy()
+
 
 def _largest_region(
-cam: np.ndarray
+    cam: np.ndarray,
 ) -> tuple[int, int, int, int] | None:
 
-```
-if cam.max() < 0.05:
-    return None
+    if cam.max() < 0.05:
+        return None
 
-mask = (
-    cam >= POI_RELATIVE_THRESHOLD * cam.max()
-).astype("uint8")
+    mask = (
+        cam >= POI_RELATIVE_THRESHOLD * cam.max()
+    ).astype("uint8")
 
-n, _, stats, _ = cv2.connectedComponentsWithStats(
-    mask,
-    connectivity=8
-)
-
-if n <= 1:
-    return None
-
-idx = 1 + int(
-    np.argmax(
-        stats[1:, cv2.CC_STAT_AREA]
+    n, _, stats, _ = cv2.connectedComponentsWithStats(
+        mask,
+        connectivity=8,
     )
-)
 
-x, y, w, h, area = stats[idx]
+    if n <= 1:
+        return None
 
-if area < (
-    POI_MIN_AREA_FRACTION
-    * cam.shape[0]
-    * cam.shape[1]
-):
-    return None
-
-pad_x = int(
-    0.03 * cam.shape[1]
-)
-
-pad_y = int(
-    0.03 * cam.shape[0]
-)
-
-x0 = max(
-    0,
-    x - pad_x
-)
-
-y0 = max(
-    0,
-    y - pad_y
-)
-
-x1 = min(
-    cam.shape[1],
-    x + w + pad_x
-)
-
-y1 = min(
-    cam.shape[0],
-    y + h + pad_y
-)
-
-return (
-    int(x0),
-    int(y0),
-    int(x1 - x0),
-    int(y1 - y0),
-)
-```
-
-def _draw_poi(
-img: np.ndarray,
-bbox: tuple[int, int, int, int]
-) -> None:
-
-```
-x, y, w, h = bbox
-
-thick = max(
-    2,
-    int(
-        round(
-            max(img.shape[:2]) / 250
+    idx = 1 + int(
+        np.argmax(
+            stats[1:, cv2.CC_STAT_AREA]
         )
     )
-)
 
-cv2.rectangle(
-    img,
-    (x, y),
-    (x + w, y + h),
-    POI_RED,
-    thick
-)
+    x, y, w, h, area = stats[idx]
 
-font_scale = max(
-    0.5,
-    max(img.shape[:2]) / 1400
-)
+    if area < (
+        POI_MIN_AREA_FRACTION
+        * cam.shape[0]
+        * cam.shape[1]
+    ):
+        return None
 
-label = "POI"
+    pad_x = int(
+        0.03 * cam.shape[1]
+    )
 
-(tw, th), base = cv2.getTextSize(
-    label,
-    cv2.FONT_HERSHEY_SIMPLEX,
-    font_scale,
-    max(1, thick - 1)
-)
+    pad_y = int(
+        0.03 * cam.shape[0]
+    )
 
-top = max(
-    0,
-    y - th - base - 6
-)
+    x0 = max(
+        0,
+        x - pad_x,
+    )
 
-cv2.rectangle(
-    img,
-    (x, top),
-    (
-        x + tw + 12,
-        top + th + base + 6
-    ),
-    POI_RED,
-    -1
-)
+    y0 = max(
+        0,
+        y - pad_y,
+    )
 
-cv2.putText(
-    img,
-    label,
-    (x + 6, top + th + 2),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    font_scale,
-    (255, 255, 255),
-    max(1, thick - 1),
-    cv2.LINE_AA
-)
-```
+    x1 = min(
+        cam.shape[1],
+        x + w + pad_x,
+    )
+
+    y1 = min(
+        cam.shape[0],
+        y + h + pad_y,
+    )
+
+    return (
+        int(x0),
+        int(y0),
+        int(x1 - x0),
+        int(y1 - y0),
+    )
+
+
+def _draw_poi(
+    img: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> None:
+
+    x, y, w, h = bbox
+
+    thick = max(
+        2,
+        int(
+            round(
+                max(img.shape[:2]) / 250
+            )
+        ),
+    )
+
+    cv2.rectangle(
+        img,
+        (x, y),
+        (x + w, y + h),
+        POI_RED,
+        thick,
+    )
+
+    font_scale = max(
+        0.5,
+        max(img.shape[:2]) / 1400,
+    )
+
+    label = "POI"
+
+    (tw, th), base = cv2.getTextSize(
+        label,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        max(1, thick - 1),
+    )
+
+    top = max(
+        0,
+        y - th - base - 6,
+    )
+
+    cv2.rectangle(
+        img,
+        (x, top),
+        (
+            x + tw + 12,
+            top + th + base + 6,
+        ),
+        POI_RED,
+        -1,
+    )
+
+    cv2.putText(
+        img,
+        label,
+        (x + 6, top + th + 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (255, 255, 255),
+        max(1, thick - 1),
+        cv2.LINE_AA,
+    )
+
 
 def _overlay(
-display: np.ndarray,
-cam: np.ndarray,
-alpha: float = 0.45
+    display: np.ndarray,
+    cam: np.ndarray,
+    alpha: float = 0.45,
 ) -> np.ndarray:
 
-```
-colour = cv2.applyColorMap(
-    np.uint8(255 * cam),
-    cv2.COLORMAP_JET
-)
+    colour = cv2.applyColorMap(
+        np.uint8(255 * cam),
+        cv2.COLORMAP_JET,
+    )
 
-colour = cv2.cvtColor(
-    colour,
-    cv2.COLOR_BGR2RGB
-)
+    colour = cv2.cvtColor(
+        colour,
+        cv2.COLOR_BGR2RGB,
+    )
 
-return np.clip(
-    (1 - alpha) * display
-    + alpha * colour,
-    0,
-    255
-).astype(np.uint8)
-```
+    return np.clip(
+        (1 - alpha) * display
+        + alpha * colour,
+        0,
+        255,
+    ).astype(np.uint8)
+
 
 def open_validated_image(
-data: bytes,
-filename: str,
-allowed_ext: tuple[str, ...],
-max_mb: int,
-min_side: int,
+    data: bytes,
+    filename: str,
+    allowed_ext: tuple[str, ...],
+    max_mb: int,
+    min_side: int,
 ) -> tuple[
-Image.Image | None,
-str | None
+    Image.Image | None,
+    str | None,
 ]:
 
-```
-ext = (
-    filename.rsplit(".", 1)[-1].lower()
-    if "." in filename
-    else ""
-)
-
-if ext not in allowed_ext:
-    return (
-        None,
-        f"Unsupported file type '.{ext}'. "
-        f"Upload a "
-        f"{', '.join(e.upper() for e in allowed_ext)} "
-        f"image."
+    ext = (
+        filename.rsplit(".", 1)[-1].lower()
+        if "." in filename
+        else ""
     )
 
-if len(data) > max_mb * 1024 * 1024:
-    return (
-        None,
-        f"File is larger than {max_mb} MB."
-    )
+    if ext not in allowed_ext:
+        return (
+            None,
+            f"Unsupported file type '.{ext}'. "
+            f"Upload a "
+            f"{', '.join(e.upper() for e in allowed_ext)} "
+            f"image.",
+        )
 
-Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    if len(data) > max_mb * 1024 * 1024:
+        return (
+            None,
+            f"File is larger than {max_mb} MB.",
+        )
 
-try:
-    probe = Image.open(
-        io.BytesIO(data)
-    )
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
-    probe.verify()
+    try:
+        probe = Image.open(
+            io.BytesIO(data)
+        )
 
-    img = Image.open(
-        io.BytesIO(data)
-    )
+        probe.verify()
 
-    img.load()
+        img = Image.open(
+            io.BytesIO(data)
+        )
 
-except Exception:
-    return (
-        None,
-        "This file is not a readable image. "
-        "Check that it is a valid PNG or JPG."
-    )
+        img.load()
 
-if img.format not in (
-    "PNG",
-    "JPEG"
-):
-    return (
-        None,
-        f"The file content is {img.format}, "
-        "not PNG/JPG."
-    )
+    except Exception:
+        return (
+            None,
+            "This file is not a readable image. "
+            "Check that it is a valid PNG or JPG.",
+        )
 
-if min(img.size) < min_side:
-    return (
-        None,
-        f"Image is too small "
-        f"({img.size[0]}×{img.size[1]} px). "
-        f"Minimum side is {min_side} px."
-    )
+    if img.format not in (
+        "PNG",
+        "JPEG",
+    ):
+        return (
+            None,
+            f"The file content is {img.format}, "
+            "not PNG/JPG.",
+        )
 
-return img, None
-```
+    if min(img.size) < min_side:
+        return (
+            None,
+            f"Image is too small "
+            f"({img.size[0]}×{img.size[1]} px). "
+            f"Minimum side is {min_side} px.",
+        )
+
+    return img, None
+
 
 @st.cache_resource(
-show_spinner="Loading breast-cancer model…"
+    show_spinner="Loading breast-cancer model…"
 )
 def get_cancer_service() -> CancerService:
 
-```
-# Download the large Keras model from Google Drive
-# if it is not already available locally.
-if not CANCER_MODEL_PATH.exists():
+    # Download the large Keras model from Google Drive
+    # if it is not already available locally.
+    if not CANCER_MODEL_PATH.exists():
 
-    CANCER_MODEL_PATH.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    file_id = (
-        "1eVBfhoeiXeoR4PmpOsadQ6p6hoofyJ2u"
-    )
-
-    url = (
-        f"https://drive.google.com/uc?id={file_id}"
-    )
-
-    downloaded = gdown.download(
-        url,
-        str(CANCER_MODEL_PATH),
-        quiet=False,
-    )
-
-    if downloaded is None:
-        raise ModelUnavailable(
-            "Could not download the breast-cancer model "
-            "from Google Drive."
+        CANCER_MODEL_PATH.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-if not CANCER_CONFIG_PATH.exists():
-    raise ModelUnavailable(
-        f"Missing file: "
-        f"{CANCER_CONFIG_PATH.name}"
-    )
+        file_id = (
+            "1eVBfhoeiXeoR4PmpOsadQ6p6hoofyJ2u"
+        )
 
-try:
+        url = (
+            f"https://drive.google.com/uc?id={file_id}"
+        )
 
-    import tensorflow as tf
+        downloaded = gdown.download(
+            url,
+            str(CANCER_MODEL_PATH),
+            quiet=False,
+        )
 
-    model = tf.keras.models.load_model(
-        CANCER_MODEL_PATH,
-        compile=False,
-    )
+        if downloaded is None:
+            raise ModelUnavailable(
+                "Could not download the breast-cancer model "
+                "from Google Drive."
+            )
 
-    config = json.loads(
-        CANCER_CONFIG_PATH.read_text()
-    )
+    if not CANCER_CONFIG_PATH.exists():
+        raise ModelUnavailable(
+            f"Missing file: "
+            f"{CANCER_CONFIG_PATH.name}"
+        )
 
-    return CancerService(
-        model,
-        config
-    )
+    try:
 
-except ModelUnavailable:
-    raise
+        import tensorflow as tf
 
-except Exception as exc:
-    raise ModelUnavailable(
-        "Could not load the breast-cancer model "
-        f"({type(exc).__name__}: {exc})"
-    ) from exc
-```
+        model = tf.keras.models.load_model(
+            CANCER_MODEL_PATH,
+            compile=False,
+        )
+
+        config = json.loads(
+            CANCER_CONFIG_PATH.read_text()
+        )
+
+        return CancerService(
+            model,
+            config,
+        )
+
+    except ModelUnavailable:
+        raise
+
+    except Exception as exc:
+        raise ModelUnavailable(
+            "Could not load the breast-cancer model "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
