@@ -158,9 +158,9 @@ class CancerService:
         )
 
         return (
-            float(score.numpy()[0]),
-            cam.numpy()
-        )
+    float(tf.reshape(score, [-1])[0].numpy()),
+    cam.numpy()
+)
 
     def analyze(
         self,
