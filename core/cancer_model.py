@@ -1,6 +1,6 @@
 """Model Service 2 — mammogram Cancer / No Cancer classifier + Grad-CAM Point-of-Interest."""
 
-from **future** import annotations
+from __future__ import annotations
 
 import io
 import json
