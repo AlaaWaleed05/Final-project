@@ -1,0 +1,12 @@
+{
+  "img_size": [
+    224,
+    224
+  ],
+  "decision_threshold": 0.5999224781990051,
+  "last_conv_layer_name": "top_conv",
+  "class_names": [
+    "No Cancer",
+    "Cancer"
+  ]
+}
