@@ -56,7 +56,8 @@ class CancerService:
         self.model = model
 
         self.img_size = tuple(
-            int(x) for x in config["img_size"]
+            int(x)
+            for x in config["img_size"]
         )
 
         self.threshold = float(
@@ -74,7 +75,10 @@ class CancerService:
             "last_conv_layer_name"
         ]
 
-        # Find the EfficientNet backbone.
+        # ---------------------------------------------------------
+        # Find the EfficientNet backbone
+        # ---------------------------------------------------------
+
         backbone = next(
             (
                 layer
@@ -100,6 +104,12 @@ class CancerService:
                 "inside the saved model."
             )
 
+        self.backbone = backbone
+
+        # ---------------------------------------------------------
+        # Find Grad-CAM convolution layer
+        # ---------------------------------------------------------
+
         try:
             last_conv_layer = backbone.get_layer(
                 self.last_conv
@@ -110,6 +120,12 @@ class CancerService:
                 f"'{self.last_conv}' inside the backbone."
             ) from exc
 
+        self.last_conv_layer = last_conv_layer
+
+        # ---------------------------------------------------------
+        # Model used for Grad-CAM
+        # ---------------------------------------------------------
+
         self.conv_model = tf.keras.Model(
             backbone.input,
             [
@@ -118,9 +134,79 @@ class CancerService:
             ],
         )
 
+        # ---------------------------------------------------------
+        # Layers after EfficientNet backbone
+        # ---------------------------------------------------------
+
         self.head_layers = model.layers[
             model.layers.index(backbone) + 1:
         ]
+
+        # =========================================================
+        # TEMPORARY MODEL DIAGNOSTIC
+        # =========================================================
+        #
+        # The current model returns:
+        #
+        #     (1, 7, 1)
+        #
+        # instead of one value.
+        #
+        # We must inspect what the "7" represents before deciding
+        # whether to use pooling, a class index, mean, max, etc.
+        #
+        # DO NOT remove this section yet.
+        # =========================================================
+
+        try:
+
+            dummy = tf.zeros(
+                (
+                    1,
+                    self.img_size[0],
+                    self.img_size[1],
+                    3,
+                ),
+                dtype=tf.float32,
+            )
+
+            _, dummy_feats = self.conv_model(
+                dummy,
+                training=False,
+            )
+
+            x = dummy_feats
+
+            shape_trace = [
+                f"backbone output: {x.shape}"
+            ]
+
+            for layer in self.head_layers:
+
+                x = layer(
+                    x,
+                    training=False,
+                )
+
+                shape_trace.append(
+                    f"{layer.name} "
+                    f"({layer.__class__.__name__}): "
+                    f"{x.shape}"
+                )
+
+            raise ModelUnavailable(
+                "Cancer model shape trace:\n"
+                + "\n".join(shape_trace)
+            )
+
+        except ModelUnavailable:
+            raise
+
+        except Exception as exc:
+            raise ModelUnavailable(
+                "Could not inspect cancer model output: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     def _forward(
         self,
@@ -148,19 +234,20 @@ class CancerService:
                     training=False,
                 )
 
-            # Convert the classifier output into a flat tensor.
             score_values = tf.reshape(
                 x,
                 [-1],
             )
 
-            # We expect exactly one classifier value
-            # for one input image.
-            if int(tf.size(score_values).numpy()) != 1:
+            if int(
+                tf.size(score_values).numpy()
+            ) != 1:
+
                 raise ModelUnavailable(
                     "Unexpected classifier output shape: "
-                    f"{x.shape}. Expected exactly one "
-                    "output value for a single image."
+                    f"{x.shape}. "
+                    "Expected exactly one output value "
+                    "for a single image."
                 )
 
             score = score_values[0]
@@ -182,7 +269,8 @@ class CancerService:
         )
 
         cam = tf.squeeze(
-            conv_out[0] @ pooled[..., tf.newaxis]
+            conv_out[0]
+            @ pooled[..., tf.newaxis]
         )
 
         cam = tf.maximum(
@@ -191,10 +279,10 @@ class CancerService:
         )
 
         cam = cam / (
-            tf.math.reduce_max(cam) + 1e-9
+            tf.math.reduce_max(cam)
+            + 1e-9
         )
 
-        # score is now a scalar Tensor.
         probability = float(
             score.numpy()
         )
@@ -291,8 +379,14 @@ def fit_display(
     if scale < 1.0:
         rgb = rgb.resize(
             (
-                max(1, int(w * scale)),
-                max(1, int(h * scale)),
+                max(
+                    1,
+                    int(w * scale),
+                ),
+                max(
+                    1,
+                    int(h * scale),
+                ),
             ),
             Image.LANCZOS,
         )
@@ -311,7 +405,8 @@ def _largest_region(
         return None
 
     mask = (
-        cam >= POI_RELATIVE_THRESHOLD * cam.max()
+        cam
+        >= POI_RELATIVE_THRESHOLD * cam.max()
     ).astype("uint8")
 
     n, _, stats, _ = cv2.connectedComponentsWithStats(
@@ -324,7 +419,10 @@ def _largest_region(
 
     idx = 1 + int(
         np.argmax(
-            stats[1:, cv2.CC_STAT_AREA]
+            stats[
+                1:,
+                cv2.CC_STAT_AREA,
+            ]
         )
     )
 
@@ -498,6 +596,7 @@ def open_validated_image(
     Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
     try:
+
         probe = Image.open(
             io.BytesIO(data)
         )
@@ -511,6 +610,7 @@ def open_validated_image(
         img.load()
 
     except Exception:
+
         return (
             None,
             "This file is not a readable image. "
@@ -521,6 +621,7 @@ def open_validated_image(
         "PNG",
         "JPEG",
     ):
+
         return (
             None,
             f"The file content is {img.format}, "
@@ -528,6 +629,7 @@ def open_validated_image(
         )
 
     if min(img.size) < min_side:
+
         return (
             None,
             f"Image is too small "
@@ -545,6 +647,7 @@ def get_cancer_service() -> CancerService:
 
     # Download the large Keras model from Google Drive
     # if it is not already available locally.
+
     if not CANCER_MODEL_PATH.exists():
 
         CANCER_MODEL_PATH.parent.mkdir(
@@ -573,6 +676,7 @@ def get_cancer_service() -> CancerService:
             )
 
     if not CANCER_CONFIG_PATH.exists():
+
         raise ModelUnavailable(
             f"Missing file: "
             f"{CANCER_CONFIG_PATH.name}"
@@ -600,6 +704,7 @@ def get_cancer_service() -> CancerService:
         raise
 
     except Exception as exc:
+
         raise ModelUnavailable(
             "Could not load the breast-cancer model "
             f"({type(exc).__name__}: {exc})"
