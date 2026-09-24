@@ -142,12 +142,12 @@ class CancerService:
         self.backbone = backbone
 
         # ---------------------------------------------------------
-        # Find Grad-CAM layer
+        # Find Grad-CAM convolution layer
         # ---------------------------------------------------------
 
         try:
 
-            last_conv_layer = (
+            self.last_conv_layer = (
                 backbone.get_layer(
                     self.last_conv
                 )
@@ -161,24 +161,43 @@ class CancerService:
                 "the backbone."
             ) from exc
 
-        self.last_conv_layer = (
-            last_conv_layer
-        )
-
         # ---------------------------------------------------------
         # Grad-CAM model
+        #
+        # Important:
+        # backbone.output is a list containing ONE Tensor.
+        # We therefore use the actual tensor inside the list.
         # ---------------------------------------------------------
+
+        backbone_output = backbone.output
+
+        if isinstance(
+            backbone_output,
+            (list, tuple),
+        ):
+
+            if len(backbone_output) != 1:
+
+                raise ModelUnavailable(
+                    "Expected the EfficientNet backbone "
+                    "to have exactly one output, but found "
+                    f"{len(backbone_output)} outputs."
+                )
+
+            backbone_output = (
+                backbone_output[0]
+            )
 
         self.conv_model = tf.keras.Model(
             backbone.input,
             [
-                last_conv_layer.output,
-                backbone.output,
+                self.last_conv_layer.output,
+                backbone_output,
             ],
         )
 
         # ---------------------------------------------------------
-        # Layers after backbone
+        # Classifier head
         # ---------------------------------------------------------
 
         backbone_index = (
@@ -189,286 +208,8 @@ class CancerService:
             backbone_index + 1:
         ]
 
-        # ---------------------------------------------------------
-        # IMPORTANT
-        #
-        # We don't assume that backbone.output is a Tensor.
-        # It can be a Tensor, list, or tuple.
-        #
-        # The current model previously returned (1, 7, 1),
-        # so we need to inspect the actual architecture before
-        # deciding how to convert it into a cancer probability.
-        # ---------------------------------------------------------
-
-        self._run_model_diagnostic()
-
     # =============================================================
-    # MODEL DIAGNOSTIC
-    # =============================================================
-
-    def _describe_value(
-        self,
-        value,
-        name: str,
-    ) -> list[str]:
-
-        tf = self.tf
-
-        if isinstance(
-            value,
-            (list, tuple),
-        ):
-
-            lines = [
-                f"{name}: "
-                f"{type(value).__name__} "
-                f"(length={len(value)})"
-            ]
-
-            for index, item in enumerate(value):
-
-                lines.extend(
-                    self._describe_value(
-                        item,
-                        f"{name}[{index}]",
-                    )
-                )
-
-            return lines
-
-        if isinstance(
-            value,
-            dict,
-        ):
-
-            lines = [
-                f"{name}: dict "
-                f"(keys={list(value.keys())})"
-            ]
-
-            for key, item in value.items():
-
-                lines.extend(
-                    self._describe_value(
-                        item,
-                        f"{name}[{key!r}]",
-                    )
-                )
-
-            return lines
-
-        try:
-
-            shape = value.shape
-
-        except Exception:
-
-            shape = None
-
-        try:
-
-            dtype = value.dtype
-
-        except Exception:
-
-            dtype = None
-
-        if isinstance(
-            value,
-            tf.Tensor,
-        ):
-
-            value_type = "Tensor"
-
-        else:
-
-            value_type = type(value).__name__
-
-        return [
-            f"{name}: "
-            f"type={value_type}, "
-            f"shape={shape}, "
-            f"dtype={dtype}"
-        ]
-
-    def _run_model_diagnostic(self):
-
-        tf = self.tf
-
-        try:
-
-            dummy = tf.zeros(
-                (
-                    1,
-                    self.img_size[0],
-                    self.img_size[1],
-                    3,
-                ),
-                dtype=tf.float32,
-            )
-
-            conv_result = (
-                self.conv_model(
-                    dummy,
-                    training=False,
-                )
-            )
-
-            if not isinstance(
-                conv_result,
-                (list, tuple),
-            ):
-
-                raise ModelUnavailable(
-                    "Unexpected Grad-CAM model output: "
-                    f"{type(conv_result).__name__}"
-                )
-
-            if len(conv_result) < 2:
-
-                raise ModelUnavailable(
-                    "Grad-CAM model returned fewer "
-                    "than two outputs."
-                )
-
-            conv_out = conv_result[0]
-            backbone_features = conv_result[1]
-
-            shape_trace = []
-
-            shape_trace.append(
-                "===== CANCER MODEL DIAGNOSTIC ====="
-            )
-
-            shape_trace.extend(
-                self._describe_value(
-                    conv_out,
-                    "Grad-CAM output",
-                )
-            )
-
-            shape_trace.extend(
-                self._describe_value(
-                    backbone_features,
-                    "Backbone output",
-                )
-            )
-
-            # -----------------------------------------------------
-            # If backbone output is a list/tuple, inspect branches
-            # -----------------------------------------------------
-
-            if isinstance(
-                backbone_features,
-                (list, tuple),
-            ):
-
-                for branch_index, branch in enumerate(
-                    backbone_features
-                ):
-
-                    shape_trace.append("")
-                    shape_trace.append(
-                        f"===== BRANCH {branch_index} ====="
-                    )
-
-                    x = branch
-
-                    for layer in self.head_layers:
-
-                        try:
-
-                            x = layer(
-                                x,
-                                training=False,
-                            )
-
-                        except Exception as exc:
-
-                            shape_trace.append(
-                                f"{layer.name} "
-                                f"({layer.__class__.__name__}) "
-                                f"FAILED: "
-                                f"{type(exc).__name__}: "
-                                f"{exc}"
-                            )
-
-                            break
-
-                        shape_trace.extend(
-                            self._describe_value(
-                                x,
-                                layer.name,
-                            )
-                        )
-
-            else:
-
-                # -------------------------------------------------
-                # Normal Tensor output
-                # -------------------------------------------------
-
-                x = backbone_features
-
-                shape_trace.append("")
-                shape_trace.append(
-                    "===== CLASSIFIER HEAD ====="
-                )
-
-                for layer in self.head_layers:
-
-                    try:
-
-                        x = layer(
-                            x,
-                            training=False,
-                        )
-
-                    except Exception as exc:
-
-                        shape_trace.append(
-                            f"{layer.name} "
-                            f"({layer.__class__.__name__}) "
-                            f"FAILED: "
-                            f"{type(exc).__name__}: "
-                            f"{exc}"
-                        )
-
-                        break
-
-                    shape_trace.extend(
-                        self._describe_value(
-                            x,
-                            layer.name,
-                        )
-                    )
-
-            shape_trace.append("")
-            shape_trace.append(
-                "===== END DIAGNOSTIC ====="
-            )
-
-            # -----------------------------------------------------
-            # Stop intentionally so we don't make an incorrect
-            # medical classification.
-            # -----------------------------------------------------
-
-            raise ModelUnavailable(
-                "\n".join(shape_trace)
-            )
-
-        except ModelUnavailable:
-            raise
-
-        except Exception as exc:
-
-            raise ModelUnavailable(
-                "Could not inspect cancer model output: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-
-    # =============================================================
-    # FORWARD PASS
+    # FORWARD + GRAD-CAM
     # =============================================================
 
     def _forward(
@@ -494,9 +235,8 @@ class CancerService:
             )
 
             # -----------------------------------------------------
-            # The final model architecture has not yet been
-            # identified. Do not guess how to reduce multiple
-            # outputs into one cancer probability.
+            # Safety: if Keras returns a list/tuple here, unwrap
+            # the single backbone feature tensor.
             # -----------------------------------------------------
 
             if isinstance(
@@ -504,11 +244,18 @@ class CancerService:
                 (list, tuple),
             ):
 
-                raise ModelUnavailable(
-                    "The EfficientNet backbone returns "
-                    "multiple outputs. The classifier "
-                    "head mapping has not been determined yet."
-                )
+                if len(feats) != 1:
+
+                    raise ModelUnavailable(
+                        "Unexpected EfficientNet backbone "
+                        f"output count: {len(feats)}."
+                    )
+
+                feats = feats[0]
+
+            # -----------------------------------------------------
+            # Apply classifier head
+            # -----------------------------------------------------
 
             x = feats
 
@@ -518,6 +265,14 @@ class CancerService:
                     x,
                     training=False,
                 )
+
+            # -----------------------------------------------------
+            # Final classifier output
+            #
+            # The model architecture was verified to produce:
+            #
+            # Dense(1) -> (1, 1)
+            # -----------------------------------------------------
 
             score_values = tf.reshape(
                 x,
@@ -531,11 +286,15 @@ class CancerService:
                 raise ModelUnavailable(
                     "Unexpected classifier output shape: "
                     f"{x.shape}. "
-                    "The model does not return exactly "
-                    "one cancer probability."
+                    "Expected exactly one output "
+                    "value for one image."
                 )
 
             score = score_values[0]
+
+        # ---------------------------------------------------------
+        # Grad-CAM
+        # ---------------------------------------------------------
 
         grads = tape.gradient(
             score,
@@ -549,28 +308,94 @@ class CancerService:
                 "gradients for the breast-cancer model."
             )
 
+        # Average gradients over spatial dimensions.
         pooled = tf.reduce_mean(
             grads,
             axis=(0, 1, 2),
         )
 
-        cam = tf.squeeze(
+        # Weighted combination of feature maps.
+        cam = tf.reduce_sum(
             conv_out[0]
-            @ pooled[..., tf.newaxis]
+            * pooled[tf.newaxis, tf.newaxis, :],
+            axis=-1,
         )
 
+        # Keep only positive contributions.
         cam = tf.maximum(
             cam,
             0,
         )
 
-        cam = cam / (
-            tf.math.reduce_max(cam)
-            + 1e-9
+        # Normalize to [0, 1].
+        cam_max = tf.reduce_max(
+            cam
+        )
+
+        cam = tf.where(
+            cam_max > 0,
+            cam / (
+                cam_max + 1e-9
+            ),
+            tf.zeros_like(cam),
         )
 
         probability = float(
             score.numpy()
+        )
+
+        # ---------------------------------------------------------
+        # Sigmoid safety
+        #
+        # The final Dense(1) should normally already have sigmoid
+        # activation. If the saved model has no sigmoid activation,
+        # convert the logit to probability.
+        # ---------------------------------------------------------
+
+        final_layer = None
+
+        if self.head_layers:
+
+            final_layer = (
+                self.head_layers[-1]
+            )
+
+        activation_name = ""
+
+        if final_layer is not None:
+
+            activation = getattr(
+                final_layer,
+                "activation",
+                None,
+            )
+
+            if activation is not None:
+
+                activation_name = getattr(
+                    activation,
+                    "__name__",
+                    "",
+                )
+
+        if activation_name != "sigmoid":
+
+            # If output is outside [0, 1], treat it as a logit.
+            if (
+                probability < 0.0
+                or probability > 1.0
+            ):
+
+                probability = float(
+                    tf.sigmoid(score).numpy()
+                )
+
+        probability = float(
+            np.clip(
+                probability,
+                0.0,
+                1.0,
+            )
         )
 
         return (
@@ -701,7 +526,7 @@ def fit_display(
 
 
 # =============================================================
-# FIND LARGEST CAM REGION
+# LARGEST CAM REGION
 # =============================================================
 
 def _largest_region(
@@ -793,7 +618,7 @@ def _largest_region(
 
 
 # =============================================================
-# DRAW POINT OF INTEREST
+# DRAW POI
 # =============================================================
 
 def _draw_poi(
@@ -886,7 +711,7 @@ def _draw_poi(
 
 
 # =============================================================
-# HEATMAP OVERLAY
+# HEATMAP
 # =============================================================
 
 def _overlay(
@@ -1016,10 +841,6 @@ def open_validated_image(
 )
 def get_cancer_service() -> CancerService:
 
-    # ---------------------------------------------------------
-    # Download model if necessary
-    # ---------------------------------------------------------
-
     if not CANCER_MODEL_PATH.exists():
 
         CANCER_MODEL_PATH.parent.mkdir(
@@ -1049,10 +870,6 @@ def get_cancer_service() -> CancerService:
                 "breast-cancer model "
                 "from Google Drive."
             )
-
-    # ---------------------------------------------------------
-    # Config
-    # ---------------------------------------------------------
 
     if not CANCER_CONFIG_PATH.exists():
 
