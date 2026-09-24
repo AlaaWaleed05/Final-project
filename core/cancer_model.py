@@ -380,7 +380,6 @@ def open_validated_image(data: bytes, filename: str, allowed_ext: tuple[str, ...
 
 
 @st.cache_resource(show_spinner="Loading breast-cancer model…")
-
 def get_cancer_service() -> CancerService:
     # Download the large Keras model if it is not already present
     if not CANCER_MODEL_PATH.exists():
